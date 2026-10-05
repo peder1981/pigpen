@@ -1,0 +1,16 @@
+{
+  "pig": "0.4.0",
+  "note": "The pig these scripts and tests target: the same major.minor, at least this patch. Raise it with the SDK bump (scripts/pig-bin.mjs). `release` pins the public PiG release CI downloads (scripts/fetch-pig.mjs) and the source commit its Piglet builds need; the sha256 values are the release's SHA256SUMS, checked against a download of each archive.",
+  "release": {
+    "repository": "MichaelKinsy/PiG",
+    "tag": "v0.4.0",
+    "commit": "76022638c15e2f68f1cee9c6b8984eee1baba620",
+    "assets": {
+      "linux/amd64": { "file": "pig-0.4.0-linux-amd64.tar.gz", "sha256": "78957c23f055f0de8fb15df04b325801144c8db11306f3a2c4a8567ea5bf9e26" },
+      "linux/arm64": { "file": "pig-0.4.0-linux-arm64.tar.gz", "sha256": "7f507c9de48cd00f6390cd18c493447799001f9cb950c57e56b65d013b0dcbf2" },
+      "darwin/arm64": { "file": "pig-0.4.0-darwin-arm64.tar.gz", "sha256": "01d44fc6f28dab34531d053356f0ece6d61eff177e660a96b6ecaa365f5499c8" },
+      "darwin/amd64": { "file": "pig-0.4.0-darwin-amd64.tar.gz", "sha256": "444d624d29b33c31b6b4895e159430ccc88d14e89278cf75c7fb663b92fd6926" },
+      "windows/amd64": { "file": "pig-0.4.0-windows-amd64.zip", "sha256": "953bdd4ad7ba5130c01836566a06a7b1c9626caf6549bda3cfae001ba34edfdd" }
+    }
+  }
+}

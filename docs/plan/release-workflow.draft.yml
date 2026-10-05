@@ -1,0 +1,215 @@
+# DRAFT. Not active, never run on GitHub. It lives under docs/plan so GitHub ignores it.
+#
+# The protected per-Piglet release workflow RELEASE-BLOCKERS.md asks for. To adopt it:
+#   1. Do the owner actions in RELEASE-BLOCKERS.md (signing keys, one environment `piglet-<name>` per
+#      Piglet holding the secret PIGLET_SIGNING_KEY with a required reviewer and deployments limited to
+#      tags `<name>/v*`, a `*/v*` tag ruleset, Actions allowed to create releases and attestations).
+#      Keep PIGLET_SIGNING_KEY an environment secret only, never a repository or organization secret:
+#      GitHub creates a missing environment on first use without protection rules, and a job in it
+#      would then read a repository secret of the same name.
+#   2. Copy this file to .github/workflows/release.yml.
+#   3. Remove the release guard from scripts/build-matrix.mjs in the same change, and keep the
+#      validation-only ci.yml (drop its `tags` trigger, which only exists to refuse tags).
+#   4. Run it once against a throwaway repository (tag a2a/v0.1.0 and herdr/v0.1.0: two Piglets with the
+#      same version) and check pull, update, a mismatched tag, an existing release and tampered bytes.
+#
+# Shape: a tag `<name>/v<release.version>` selects one Piglet. `plan` checks the tag against the
+# manifest (name and release.version) and emits the build.targets matrix. Each target builds on its
+# native runner from the staged tree (`npm run stage`: an authored manifest selects Packages outside its
+# directory, which PiG rejects), signs with the Piglet's key and attests provenance. `publish` collects
+# the Binaries into release-artifacts/ and runs `pig piglet publish --tag-prefix <name>/ --artifacts`. Nothing is built or
+# signed outside the protected environment, and nothing is uploaded except by the publisher. The
+# signing key (and the release token) reach only the step that signs or publishes, not npm or staging.
+#
+# Adapted from PiG's docs/examples/piglet-release.yml (PiG v0.4.0). Verified locally, with a stub `gh`
+# and a throwaway key, by running the `run` scripts of this file as written: the `plan` script with a
+# matching tag and with a wrong version, a bare `vX.Y.Z` and an unknown name (the last three are refused);
+# both build steps for herdr linux/amd64 (signed Binary, key file removed); both publish steps, with
+# `--targets linux/amd64` added because only that target was built (signed `piglet-release.json` and
+# `SHA256SUMS`, tag `herdr/v0.1.0`); the file parses as YAML. Not verified: hosted runners, environments,
+# secrets, attestations, artifact upload and download, the other four targets.
+name: Release a Piglet
+
+on:
+  push:
+    tags: ['*/v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIG_REF: 76022638c15e2f68f1cee9c6b8984eee1baba620 # PiG v0.4.0
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      name: ${{ steps.plan.outputs.name }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts
+      - name: The tag must be <manifest name>/v<release.version>
+        id: plan
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            import { readManifests } from "./scripts/generate-index.mjs";
+            const tag = process.env.GITHUB_REF_NAME;
+            const hit = readManifests().filter(({ manifest }) => tag === `${manifest.name}/v${manifest.release.version}`);
+            if (hit.length !== 1) throw new Error(`Tag ${tag} matches ${hit.length} Piglets (need exactly one name/vX.Y.Z)`);
+            const m = hit[0].manifest;
+            const runners = { "linux/amd64": "ubuntu-24.04", "linux/arm64": "ubuntu-24.04-arm", "darwin/arm64": "macos-15", "darwin/amd64": "macos-15-intel", "windows/amd64": "windows-2025" };
+            const include = (m.build?.targets ?? []).map((t) => { if (!runners[t]) throw new Error(`No native runner for ${t}`); const [goos, goarch] = t.split("/"); return { goos, goarch, runner: runners[t] }; });
+            if (!include.length) throw new Error("Every Piglet needs explicit build.targets");
+            appendFileSync(process.env.GITHUB_OUTPUT, `name=${m.name}\nmatrix=${JSON.stringify({ include })}\n`);
+          '
+
+  build:
+    needs: plan
+    name: Build ${{ needs.plan.outputs.name }} ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    environment: piglet-${{ needs.plan.outputs.name }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Keep checked-out line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Check out PiG
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: MichaelKinsy/PiG
+          ref: ${{ env.PIG_REF }}
+          path: .pig-src
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: .pig-src/go.mod
+          cache-dependency-path: .pig-src/go.sum
+      - name: Build PiG and stage the Piglet (no secrets)
+        shell: bash
+        env:
+          PIG_HOME: ${{ runner.temp }}/pig-home
+          PIG_SOURCE_ROOT: ${{ github.workspace }}/.pig-src
+        run: |
+          set -euo pipefail
+          exe="$(go env GOEXE)"
+          mkdir -p .pig-bin dist
+          go -C .pig-src build -trimpath -o "../.pig-bin/pig$exe" ./cmd/pig
+          echo "PIG_BIN=$PWD/.pig-bin/pig$exe" >> "$GITHUB_ENV"
+          export PIG_BIN="$PWD/.pig-bin/pig$exe"
+          npm ci --ignore-scripts
+          npm run stage
+      - name: Build the signed Binary
+        shell: bash
+        env:
+          NAME: ${{ needs.plan.outputs.name }}
+          PIGLET_SIGNING_KEY: ${{ secrets.PIGLET_SIGNING_KEY }}
+          PIG_HOME: ${{ runner.temp }}/pig-home
+          PIG_SOURCE_ROOT: ${{ github.workspace }}/.pig-src
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          exe="$(go env GOEXE)"
+          key="$RUNNER_TEMP/piglet-signing.key"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$PIGLET_SIGNING_KEY" > "$key"
+          "$PIG_BIN" piglet build "dist/staged/piglets/$NAME/piglet.yaml" --format binary --builder native \
+            --targets "$TARGET_OS/$TARGET_ARCH" --sign-key "$key" \
+            --out "dist/piglet-$TARGET_OS-$TARGET_ARCH$exe" --no-input
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/piglet-*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: piglet-binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/piglet-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    environment: piglet-${{ needs.plan.outputs.name }}
+    permissions:
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Check out PiG
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: MichaelKinsy/PiG
+          ref: ${{ env.PIG_REF }}
+          path: .pig-src
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: .pig-src/go.mod
+          cache-dependency-path: .pig-src/go.sum
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: piglet-binary-*
+          # Not dist/: `npm run stage` writes dist/staged, and --artifacts must hold only signed Binaries.
+          path: release-artifacts
+          merge-multiple: true
+      - name: Build PiG and stage the Piglet (no secrets)
+        shell: bash
+        env:
+          PIG_HOME: ${{ runner.temp }}/pig-home
+          PIG_SOURCE_ROOT: ${{ github.workspace }}/.pig-src
+        run: |
+          set -euo pipefail
+          mkdir -p .pig-bin
+          go -C .pig-src build -trimpath -o ../.pig-bin/pig ./cmd/pig
+          echo "PIG_BIN=$PWD/.pig-bin/pig" >> "$GITHUB_ENV"
+          export PIG_BIN="$PWD/.pig-bin/pig"
+          npm ci --ignore-scripts
+          npm run stage
+      - name: Publish with the Piglet's namespace
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ needs.plan.outputs.name }}
+          PIGLET_SIGNING_KEY: ${{ secrets.PIGLET_SIGNING_KEY }}
+          PIG_HOME: ${{ runner.temp }}/pig-home
+          PIG_SOURCE_ROOT: ${{ github.workspace }}/.pig-src
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/piglet-signing.key"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$PIGLET_SIGNING_KEY" > "$key"
+          "$PIG_BIN" piglet publish "dist/staged/piglets/$NAME/piglet.yaml" --to github --repo "$GITHUB_REPOSITORY" \
+            --sign-key "$key" --artifacts release-artifacts --tag-prefix "$NAME/" --commit "$GITHUB_SHA" --yes --no-input
